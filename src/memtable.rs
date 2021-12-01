@@ -43,29 +43,31 @@ impl Memtable {
 
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
         let crc = Crc::<u32>::new(&CRC_32_AIXM);
-        let mut reader = ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true)
-            .from_path(&path)?;
         let mut tree = BTreeMap::new();
         let mut next_pos = 0;
-        let mut record = ByteRecord::new();
-        loop {
-            match reader.read_byte_record(&mut record) {
-                Ok(more) => {
-                    if let Some((key, value)) = Self::read_record(&crc, &record) {
-                        tree.insert(key, value);
-                        next_pos = reader.position().byte();
-                    } else {
-                        break;
+        if let Ok(mut reader) = ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_path(&path)
+        {
+            let mut record = ByteRecord::new();
+            loop {
+                match reader.read_byte_record(&mut record) {
+                    Ok(more) => {
+                        if let Some((key, value)) = Self::read_record(&crc, &record) {
+                            tree.insert(key, value);
+                            next_pos = reader.position().byte();
+                        } else {
+                            break;
+                        }
+                        if !more {
+                            break;
+                        }
+                        record.clear();
                     }
-                    if !more {
-                        break;
+                    Err(err) => {
+                        eprintln!("read record error: {}", err);
                     }
-                    record.clear();
-                }
-                Err(err) => {
-                    eprintln!("read record error: {}", err);
                 }
             }
         }
