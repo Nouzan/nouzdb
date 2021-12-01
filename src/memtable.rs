@@ -1,6 +1,7 @@
 use crate::{Map, MapError};
 use csv::{ReaderBuilder, StringRecord, Writer, WriterBuilder};
 use std::fs::OpenOptions;
+use std::io::Seek;
 use std::path::Path;
 use std::{collections::BTreeMap, fs::File};
 
@@ -12,7 +13,7 @@ pub struct Memtable {
 }
 
 impl Memtable {
-    fn parse_record(record: StringRecord) -> Option<(String, String)> {
+    fn parse_record(record: &StringRecord) -> Option<(String, String)> {
         let key = record.get(0)?.to_string();
         let value = record.get(1)?.to_string();
         Some((key, value))
@@ -21,19 +22,19 @@ impl Memtable {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
         let mut reader = ReaderBuilder::new().has_headers(false).from_path(&path)?;
         let mut tree = BTreeMap::new();
-        for record in reader.records() {
-            match record {
-                Ok(record) => {
-                    if let Some((key, value)) = Self::parse_record(record) {
-                        tree.insert(key, value);
-                    }
-                }
-                Err(err) => {
-                    eprintln!("error reading log: err={}", err);
-                }
+        let mut next_pos = 0;
+        let mut record = StringRecord::new();
+        while reader.read_record(&mut record).is_ok() {
+            if let Some((key, value)) = Self::parse_record(&record) {
+                tree.insert(key, value);
+                next_pos = reader.position().byte();
+            } else {
+                break;
             }
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+        file.seek(std::io::SeekFrom::Start(next_pos))?;
+        file.set_len(next_pos)?;
         let log = WriterBuilder::new().has_headers(false).from_writer(file);
         Ok(Self { log, tree })
     }
