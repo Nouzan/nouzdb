@@ -4,6 +4,7 @@
 
 pub mod database;
 pub mod errors;
+mod memtable;
 pub mod traits;
 
 pub use database::Database;

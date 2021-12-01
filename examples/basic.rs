@@ -1,12 +1,9 @@
-use std::path::Path;
-
 use anyhow::Result;
 use nouzdb::{Database, Map};
 
 fn main() -> Result<()> {
-    let path = Path::new("/var/nouzdb/data");
-    let mut db = Database::new(path);
+    let mut db = Database::new("data/", "log.csv")?;
     db.set("hello", "world")?;
-    assert_eq!(db.get("hello".as_bytes())?, b"world");
+    assert_eq!(db.get("hello")?, "world");
     Ok(())
 }
