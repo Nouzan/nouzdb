@@ -1,6 +1,5 @@
 use crate::errors::MapError;
 use bytes::Bytes;
-use std::borrow::Borrow;
 
 /// A Map.
 pub trait Map {
