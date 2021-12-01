@@ -1,8 +1,11 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
-}
+//! An embedded database for learning purpose that is based on SSTables.
+
+#![deny(missing_docs)]
+
+pub mod database;
+pub mod errors;
+pub mod traits;
+
+pub use database::Database;
+pub use errors::MapError;
+pub use traits::Map;
