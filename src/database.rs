@@ -3,6 +3,7 @@
 use crate::errors::MapError;
 use crate::memtable::Memtable;
 use crate::traits::Map;
+use bytes::Bytes;
 use std::{fs::DirBuilder, path::Path};
 use thiserror::Error;
 
@@ -33,16 +34,14 @@ impl Database {
 }
 
 impl Map for Database {
-    fn get<Q>(&self, key: &Q) -> Result<&str, MapError>
+    fn get<Q>(&self, key: &Q) -> Result<&[u8], MapError>
     where
-        Q: ?Sized,
-        String: std::borrow::Borrow<Q>,
-        Q: Ord,
+        Q: AsRef<[u8]>,
     {
         self.memtable.get(key)
     }
 
-    fn set<K: ToString, V: ToString>(&mut self, key: K, value: V) -> Result<(), MapError> {
+    fn set<K: Into<Bytes>, V: Into<Bytes>>(&mut self, key: K, value: V) -> Result<(), MapError> {
         self.memtable.set(key, value)
     }
 }
