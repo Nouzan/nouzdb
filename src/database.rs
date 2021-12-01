@@ -16,7 +16,6 @@ pub enum Error {
 }
 
 /// A [`Database`] instance.
-#[derive(Debug)]
 pub struct Database {
     data_dir: String,
     memtable: Memtable,

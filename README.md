@@ -4,7 +4,7 @@ An embedded database for learning purpose that is based on SSTables.
 ## Plan
 - [x] Implement a memtable.
 - [x] Implement the write-ahead logging mechanism for the memtable.
-- [ ] Implement errors detection and recovery process for write-ahead log.
+- [x] Implement errors detection and recovery process for write-ahead log.
 - [ ] Write out to a sorted-string segement file when the memtable grows too big, and create a new one.
 - [ ] Allow searching for keys in sorted-string segement files.
 - [ ] Implement a merging process for the segement files.
