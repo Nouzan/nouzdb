@@ -2,6 +2,7 @@
 
 use crate::errors::MapError;
 use crate::memtable::Memtable;
+pub use crate::memtable::MemtableError;
 use crate::traits::Map;
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -18,6 +19,10 @@ pub enum Error {
     /// Invalid log file name.
     #[error("invalid log file name: {0:?}")]
     InvalidLogFileName(OsString),
+
+    /// Memtable errors.
+    #[error(transparent)]
+    Memtable(#[from] MemtableError),
 }
 
 const DOT: char = '.';

@@ -12,4 +12,8 @@ pub enum MapError {
     /// Key is not allowed.
     #[error("key is not allowed")]
     KeyNotAllow,
+
+    /// Io errors.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }

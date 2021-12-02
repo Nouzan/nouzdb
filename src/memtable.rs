@@ -7,13 +7,34 @@ use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{collections::BTreeMap, fs::File};
+use thiserror::Error;
+
+/// Memtable Errors.
+#[derive(Debug, Error)]
+pub enum MemtableError {
+    /// Io errors.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Parse log id error.
+    #[error("error parsing {0} into log id")]
+    ParseLogId(String),
+}
+
+const SWITCH_ACTIVE_SIZE: usize = 1024 * 1024;
 
 /// Memtable.
 pub struct Memtable {
     log: Writer<File>,
     active_tree: BTreeMap<Bytes, Bytes>,
     freeze_tree: Option<Arc<BTreeMap<Bytes, Bytes>>>,
+    active_size: usize,
+    active_log_id: u64,
+
     crc: Crc<u32>,
+    log_dir: PathBuf,
+    log_suffix: String,
+    switch_active_size: usize,
 }
 
 impl Memtable {
@@ -46,9 +67,10 @@ impl Memtable {
     fn build_tree_from_path<P: AsRef<Path>>(
         crc: &Crc<u32>,
         path: &P,
-    ) -> Result<(BTreeMap<Bytes, Bytes>, u64), std::io::Error> {
+    ) -> Result<(BTreeMap<Bytes, Bytes>, u64, usize), std::io::Error> {
         let mut tree = BTreeMap::new();
         let mut next_pos = 0;
+        let mut size = 0;
         if let Ok(mut reader) = ReaderBuilder::new()
             .has_headers(false)
             .flexible(true)
@@ -59,7 +81,14 @@ impl Memtable {
                 match reader.read_byte_record(&mut record) {
                     Ok(more) => {
                         if let Some((key, value)) = Self::read_record(&crc, &record) {
-                            tree.insert(key, value);
+                            let key_size = key.len();
+                            let value_size = value.len();
+                            if let Some(old_value) = tree.insert(key, value) {
+                                size -= old_value.len();
+                            } else {
+                                size += key_size;
+                            }
+                            size += value_size;
                             next_pos = reader.position().byte();
                         } else {
                             break;
@@ -75,29 +104,34 @@ impl Memtable {
                 }
             }
         }
-        Ok((tree, next_pos))
+        Ok((tree, next_pos, size))
     }
 
     pub fn new<P: AsRef<Path>>(
         logs: BTreeMap<String, PathBuf>,
         log_dir: P,
         log_suffix: &str,
-    ) -> Result<Self, std::io::Error> {
+    ) -> Result<Self, MemtableError> {
         let crc = Crc::<u32>::new(&CRC_32_AIXM);
         let mut logs = logs.into_iter();
         let mut active_tree = None;
         let mut freeze_tree = None;
         let mut log_file = None;
-        while let Some((_, path)) = logs.next_back() {
+        let mut active_log_id = 1;
+        let mut active_size = 0;
+        while let Some((id, path)) = logs.next_back() {
             if active_tree.is_none() {
-                let (tree, next_pos) = Self::build_tree_from_path(&crc, &path)?;
+                let log_id: u64 = id.parse().map_err(|_| MemtableError::ParseLogId(id))?;
+                let (tree, next_pos, size) = Self::build_tree_from_path(&crc, &path)?;
+                active_size = size;
                 active_tree = Some(tree);
                 let mut file = OpenOptions::new().create(true).write(true).open(path)?;
                 file.seek(std::io::SeekFrom::Start(next_pos))?;
                 file.set_len(next_pos)?;
                 log_file = Some(file);
+                active_log_id = log_id;
             } else if freeze_tree.is_none() {
-                let (tree, _) = Self::build_tree_from_path(&crc, &path)?;
+                let (tree, _, _) = Self::build_tree_from_path(&crc, &path)?;
                 freeze_tree = Some(Arc::new(tree));
             } else {
                 let _ = std::fs::remove_file(path);
@@ -106,17 +140,39 @@ impl Memtable {
         let file = if let Some(log_file) = log_file {
             log_file
         } else {
-            let path = log_dir.as_ref().join(format!("1.{}", log_suffix));
+            let path = log_dir
+                .as_ref()
+                .join(format!("{}.{}", active_log_id, log_suffix));
             OpenOptions::new().create(true).write(true).open(path)?
         };
         let log = WriterBuilder::new().has_headers(false).from_writer(file);
         let active_tree = active_tree.unwrap_or_default();
         Ok(Self {
+            active_size,
             log,
             active_tree,
             crc,
             freeze_tree,
+            log_dir: log_dir.as_ref().to_owned(),
+            log_suffix: log_suffix.to_string(),
+            active_log_id,
+            switch_active_size: SWITCH_ACTIVE_SIZE,
         })
+    }
+
+    pub(crate) fn force_switch(&mut self) -> Result<(), std::io::Error> {
+        self.active_log_id += 1;
+        let path = self
+            .log_dir
+            .as_path()
+            .join(format!("{}.{}", self.active_log_id, self.log_suffix));
+        let file = OpenOptions::new().create(true).write(true).open(path)?;
+        let log = WriterBuilder::new().has_headers(false).from_writer(file);
+        let mut active_tree = BTreeMap::new();
+        std::mem::swap(&mut self.active_tree, &mut active_tree);
+        self.freeze_tree = Some(Arc::new(active_tree));
+        self.log = log;
+        Ok(())
     }
 }
 
@@ -146,7 +202,17 @@ impl Map for Memtable {
             .write_record(&record)
             .map_err(|_| MapError::WriteLog)?;
         self.log.flush().map_err(|_| MapError::WriteLog)?;
-        self.active_tree.insert(key, value);
+        let key_size = key.len();
+        let value_size = value.len();
+        if let Some(old_value) = self.active_tree.insert(key, value) {
+            self.active_size -= old_value.len();
+        } else {
+            self.active_size += key_size;
+        }
+        self.active_size += value_size;
+        if self.active_size > self.switch_active_size && self.freeze_tree.is_none() {
+            self.force_switch()?;
+        }
         Ok(())
     }
 }
