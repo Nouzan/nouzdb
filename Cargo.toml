@@ -13,3 +13,4 @@ crc = "2.1.0"
 [dev-dependencies]
 anyhow = "1.0.51"
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
+rustyline = "9.0.0"

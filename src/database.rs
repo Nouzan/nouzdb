@@ -6,11 +6,13 @@ pub use crate::memtable::MemtableError;
 use crate::segment::RawSegment;
 use crate::traits::Map;
 use bytes::Bytes;
-use csv::{ByteRecord, ReaderBuilder};
+use csv::{ByteRecord, ReaderBuilder, WriterBuilder};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::thread;
+
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use std::{ffi::OsString, fs::DirBuilder, path::Path};
 use thiserror::Error;
 
@@ -38,11 +40,12 @@ const DOT: char = '.';
 
 /// A [`Database`] instance.
 pub struct Database {
+    exiter: Option<mpsc::Sender<()>>,
     data_dir: PathBuf,
     data_suffix: String,
     memtable: Arc<RwLock<Memtable>>,
     segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
-    max_segment_id: u64,
+    max_segment_id: Arc<Mutex<u64>>,
     tasks: Vec<thread::JoinHandle<Result<(), std::io::Error>>>,
 }
 
@@ -90,21 +93,39 @@ impl Database {
         let memtable = Arc::new(RwLock::new(memtable));
         let segments = Arc::new(RwLock::new(segments));
         let mut db = Self {
+            exiter: None,
             data_dir,
             memtable,
             data_suffix,
             segments,
-            max_segment_id,
+            max_segment_id: Arc::new(Mutex::new(max_segment_id)),
             tasks: Vec::new(),
         };
         if let Some(segment) = segment {
             db.write_segment(segment)?;
         }
+        db.start_merging_task();
         Ok(db)
+    }
+
+    fn start_merging_task(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        let max_segment_id = self.max_segment_id.clone();
+        let segments = self.segments.clone();
+        let dir = self.data_dir.clone();
+        let suffix = self.data_suffix.clone();
+        let task = thread::spawn(move || -> Result<(), std::io::Error> {
+            Self::merge_segments(rx, max_segment_id, segments, dir, suffix)
+        });
+        self.exiter = Some(tx);
+        self.tasks.push(task);
     }
 
     /// Force close.
     pub fn force_close(&mut self) {
+        if let Some(exiter) = self.exiter.take() {
+            let _ = exiter.send(());
+        }
         self.tasks.clear();
     }
 
@@ -114,25 +135,42 @@ impl Database {
         Some((key, value))
     }
 
-    fn write_segment(&mut self, segment: RawSegment) -> Result<(), std::io::Error> {
-        self.max_segment_id += 1;
-        let segment_id = self.max_segment_id;
-        let memtable = self.memtable.clone();
-        let segments = self.segments.clone();
-        let path = self
-            .data_dir
-            .as_path()
-            .join(format!("{}.{}", segment_id, self.data_suffix));
-        let tmp_path = self.data_dir.as_path().join(format!("{}.tmp", segment_id));
-        let task = thread::spawn(move || -> Result<(), std::io::Error> {
+    fn do_write_segment<P: AsRef<Path>>(
+        memtable: Arc<RwLock<Memtable>>,
+        segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+        max_segment_id: Arc<Mutex<u64>>,
+        dir: &P,
+        suffix: &str,
+        segment: RawSegment,
+    ) -> JoinHandle<Result<(), std::io::Error>> {
+        let dir = dir.as_ref().to_owned();
+        let suffix = suffix.to_string();
+        thread::spawn(move || -> Result<(), std::io::Error> {
+            let mut segment_id = max_segment_id.lock().unwrap();
+            *segment_id += 1;
+            let path = dir.as_path().join(format!("{}.{}", segment_id, suffix));
+            let tmp_path = dir.as_path().join(format!("{}.tmp", segment_id));
             tracing::info!("writing new segment {} to path {:?}", segment_id, tmp_path);
             segment.write_to_path(&tmp_path)?;
             std::fs::rename(&tmp_path, &path)?;
             tracing::info!("new segment {} is written to path {:?}", segment_id, path);
             memtable.write().unwrap().finalize_switch()?;
-            segments.write().unwrap().insert(segment_id, path);
+            segments.write().unwrap().insert(*segment_id, path);
             Ok(())
-        });
+        })
+    }
+
+    fn write_segment(&mut self, segment: RawSegment) -> Result<(), std::io::Error> {
+        let memtable = self.memtable.clone();
+        let segments = self.segments.clone();
+        let task = Self::do_write_segment(
+            memtable,
+            segments,
+            self.max_segment_id.clone(),
+            &self.data_dir,
+            &self.data_suffix,
+            segment,
+        );
         self.tasks.push(task);
         Ok(())
     }
@@ -163,6 +201,129 @@ impl Database {
             }
         }
         Ok(None)
+    }
+
+    fn merge_segments(
+        exiter: mpsc::Receiver<()>,
+        max_segment_id: Arc<Mutex<u64>>,
+        segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+        dir: PathBuf,
+        suffix: String,
+    ) -> Result<(), std::io::Error> {
+        let merge_period = std::time::Duration::from_secs(60);
+        let mut last_tick = Instant::now();
+        loop {
+            thread::sleep(std::time::Duration::from_millis(100));
+            match exiter.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    break;
+                }
+                Err(_) => {
+                    if last_tick.elapsed() >= merge_period {
+                        if segments.read().unwrap().len() <= 1 {
+                            continue;
+                        }
+                        let mut segment_id = max_segment_id.lock().unwrap();
+                        *segment_id += 1;
+                        last_tick = Instant::now();
+                        let mut segment_readers = BTreeMap::new();
+                        let mut failed = false;
+                        for (id, path) in segments.read().unwrap().iter() {
+                            if let Ok(reader) =
+                                ReaderBuilder::new().has_headers(false).from_path(path)
+                            {
+                                segment_readers.insert(*id, reader);
+                            } else {
+                                failed = true;
+                                break;
+                            }
+                        }
+                        if !failed {
+                            let path = dir.as_path().join(format!("{}.{}", segment_id, suffix));
+                            let tmp_path = dir.as_path().join(format!("{}.tmp", segment_id));
+                            let mut failed = false;
+                            if let Ok(mut writer) =
+                                WriterBuilder::new().has_headers(false).from_path(&tmp_path)
+                            {
+                                tracing::info!("merging segments to to path {:?}", tmp_path);
+                                let mut segment_records = segment_readers
+                                    .iter_mut()
+                                    .map(|(id, reader)| (id, reader.byte_records().peekable()))
+                                    .collect::<BTreeMap<_, _>>();
+                                loop {
+                                    let mut done = Vec::new();
+                                    let mut smallest = None;
+                                    for (id, segment) in segment_records.iter_mut().rev() {
+                                        if let Some(record) = segment.peek() {
+                                            if let Some(key) = record
+                                                .as_ref()
+                                                .ok()
+                                                .and_then(|record| record.get(0))
+                                            {
+                                                if let Some((_, smallest_key)) = smallest.as_ref() {
+                                                    if key < smallest_key {
+                                                        smallest = Some((
+                                                            **id,
+                                                            Bytes::copy_from_slice(key),
+                                                        ));
+                                                    } else if key == smallest_key {
+                                                        segment.next();
+                                                    }
+                                                } else {
+                                                    smallest =
+                                                        Some((**id, Bytes::copy_from_slice(key)));
+                                                }
+                                            } else {
+                                                segment.next();
+                                            }
+                                        } else {
+                                            done.push(**id);
+                                        }
+                                    }
+                                    if let Some((smallest_id, _)) = smallest {
+                                        if let Some(record) = segment_records
+                                            .get_mut(&smallest_id)
+                                            .and_then(|record| record.next())
+                                            .and_then(|record| record.ok())
+                                        {
+                                            if writer.write_byte_record(&record).is_err() {
+                                                failed = true;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                    for id in done {
+                                        segment_records.remove(&id);
+                                    }
+                                }
+                                if !failed {
+                                    if let Err(err) = std::fs::rename(&tmp_path, &path) {
+                                        tracing::error!(
+                                            "failed to rename the merged segment file: err={}",
+                                            err
+                                        );
+                                    } else {
+                                        for id in segment_readers.keys() {
+                                            if let Some(path) = segments.write().unwrap().remove(id)
+                                            {
+                                                if let Err(err) = std::fs::remove_file(&path) {
+                                                    tracing::error!("failed to remove the old segment file in path {:?}, err={}", path, err);
+                                                }
+                                            }
+                                        }
+                                        tracing::info!("merged segments to to path {:?}", path);
+                                        segments.write().unwrap().insert(*segment_id, path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -197,6 +358,9 @@ impl Map for Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        if let Some(exiter) = self.exiter.take() {
+            let _ = exiter.send(());
+        }
         for task in self.tasks.drain(..) {
             let _ = task.join();
         }

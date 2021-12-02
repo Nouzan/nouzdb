@@ -12,7 +12,7 @@ pub struct RawSegment {
 impl RawSegment {
     /// Write to path.
     pub fn write_to_path<P: AsRef<Path>>(&self, path: &P) -> Result<(), std::io::Error> {
-        let file = OpenOptions::new().create_new(true).write(true).open(path)?;
+        let file = OpenOptions::new().create(true).write(true).open(path)?;
         let mut writer = WriterBuilder::new().has_headers(false).from_writer(file);
         for (key, value) in self.freeze.iter() {
             let mut record = ByteRecord::new();
