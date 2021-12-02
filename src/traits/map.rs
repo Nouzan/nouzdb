@@ -1,10 +1,11 @@
 use crate::errors::MapError;
 use bytes::Bytes;
+use std::sync::Arc;
 
 /// A Map.
 pub trait Map {
     /// Get the value corresponding to the given key.
-    fn get<Q>(&self, key: &Q) -> Result<Option<&[u8]>, MapError>
+    fn get<Q>(&self, key: &Q) -> Result<Option<Arc<Bytes>>, MapError>
     where
         Q: AsRef<[u8]>;
 

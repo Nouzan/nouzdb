@@ -1,3 +1,4 @@
+use crate::segment::RawSegment;
 use crate::{Map, MapError};
 use bytes::{Buf, Bytes};
 use crc::{Crc, CRC_32_AIXM};
@@ -8,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{collections::BTreeMap, fs::File};
 use thiserror::Error;
+
+pub(crate) type Tree = BTreeMap<Bytes, Arc<Bytes>>;
 
 /// Memtable Errors.
 #[derive(Debug, Error)]
@@ -21,15 +24,14 @@ pub enum MemtableError {
     ParseLogId(String),
 }
 
-const SWITCH_ACTIVE_SIZE: usize = 1024 * 1024;
-
 /// Memtable.
 pub struct Memtable {
     log: Writer<File>,
-    active_tree: BTreeMap<Bytes, Bytes>,
-    freeze_tree: Option<Arc<BTreeMap<Bytes, Bytes>>>,
+    active_tree: Tree,
+    freeze_tree: Option<Arc<Tree>>,
     active_size: usize,
     active_log_id: u64,
+    freeze_log_id: Option<u64>,
 
     crc: Crc<u32>,
     log_dir: PathBuf,
@@ -67,7 +69,7 @@ impl Memtable {
     fn build_tree_from_path<P: AsRef<Path>>(
         crc: &Crc<u32>,
         path: &P,
-    ) -> Result<(BTreeMap<Bytes, Bytes>, u64, usize), std::io::Error> {
+    ) -> Result<(Tree, u64, usize), std::io::Error> {
         let mut tree = BTreeMap::new();
         let mut next_pos = 0;
         let mut size = 0;
@@ -83,7 +85,7 @@ impl Memtable {
                         if let Some((key, value)) = Self::read_record(&crc, &record) {
                             let key_size = key.len();
                             let value_size = value.len();
-                            if let Some(old_value) = tree.insert(key, value) {
+                            if let Some(old_value) = tree.insert(key, Arc::new(value)) {
                                 size -= old_value.len();
                             } else {
                                 size += key_size;
@@ -99,7 +101,7 @@ impl Memtable {
                         record.clear();
                     }
                     Err(err) => {
-                        eprintln!("read record error: {}", err);
+                        tracing::error!("read record error: {}", err);
                     }
                 }
             }
@@ -111,17 +113,20 @@ impl Memtable {
         logs: BTreeMap<String, PathBuf>,
         log_dir: P,
         log_suffix: &str,
-    ) -> Result<Self, MemtableError> {
+        switch_mem_size: usize,
+    ) -> Result<(Self, Option<RawSegment>), MemtableError> {
         let crc = Crc::<u32>::new(&CRC_32_AIXM);
         let mut logs = logs.into_iter();
         let mut active_tree = None;
         let mut freeze_tree = None;
         let mut log_file = None;
         let mut active_log_id = 1;
+        let mut freeze_log_id = None;
         let mut active_size = 0;
+        let mut segment = None;
         while let Some((id, path)) = logs.next_back() {
             if active_tree.is_none() {
-                let log_id: u64 = id.parse().map_err(|_| MemtableError::ParseLogId(id))?;
+                let log_id = id.parse().map_err(|_| MemtableError::ParseLogId(id))?;
                 let (tree, next_pos, size) = Self::build_tree_from_path(&crc, &path)?;
                 active_size = size;
                 active_tree = Some(tree);
@@ -131,8 +136,12 @@ impl Memtable {
                 log_file = Some(file);
                 active_log_id = log_id;
             } else if freeze_tree.is_none() {
+                let log_id = id.parse().map_err(|_| MemtableError::ParseLogId(id))?;
                 let (tree, _, _) = Self::build_tree_from_path(&crc, &path)?;
-                freeze_tree = Some(Arc::new(tree));
+                let tree = Arc::new(tree);
+                freeze_tree = Some(tree.clone());
+                freeze_log_id = Some(log_id);
+                segment = Some(RawSegment::from(tree));
             } else {
                 let _ = std::fs::remove_file(path);
             }
@@ -147,20 +156,25 @@ impl Memtable {
         };
         let log = WriterBuilder::new().has_headers(false).from_writer(file);
         let active_tree = active_tree.unwrap_or_default();
-        Ok(Self {
-            active_size,
-            log,
-            active_tree,
-            crc,
-            freeze_tree,
-            log_dir: log_dir.as_ref().to_owned(),
-            log_suffix: log_suffix.to_string(),
-            active_log_id,
-            switch_active_size: SWITCH_ACTIVE_SIZE,
-        })
+        Ok((
+            Self {
+                active_size,
+                log,
+                active_tree,
+                crc,
+                freeze_tree,
+                freeze_log_id,
+                log_dir: log_dir.as_ref().to_owned(),
+                log_suffix: log_suffix.to_string(),
+                active_log_id,
+                switch_active_size: switch_mem_size,
+            },
+            segment,
+        ))
     }
 
-    pub(crate) fn force_switch(&mut self) -> Result<(), std::io::Error> {
+    fn force_switch(&mut self) -> Result<RawSegment, std::io::Error> {
+        self.freeze_log_id = Some(self.active_log_id);
         self.active_log_id += 1;
         let path = self
             .log_dir
@@ -170,25 +184,54 @@ impl Memtable {
         let log = WriterBuilder::new().has_headers(false).from_writer(file);
         let mut active_tree = BTreeMap::new();
         std::mem::swap(&mut self.active_tree, &mut active_tree);
-        self.freeze_tree = Some(Arc::new(active_tree));
+        let tree = Arc::new(active_tree);
+        self.freeze_tree = Some(tree.clone());
         self.log = log;
+        tracing::info!("swithced to new memtable {}.", self.active_log_id);
+        Ok(RawSegment::from(tree))
+    }
+
+    pub(crate) fn try_switch(&mut self) -> Result<Option<RawSegment>, std::io::Error> {
+        tracing::debug!(
+            "active_size={} switch_size={}",
+            self.active_size,
+            self.switch_active_size
+        );
+        if self.active_size > self.switch_active_size && self.freeze_tree.is_none() {
+            let segment = self.force_switch()?;
+            Ok(Some(segment))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn finalize_switch(&mut self) -> Result<(), std::io::Error> {
+        self.freeze_tree = None;
+        if let Some(log_id) = self.freeze_log_id.take() {
+            let path = self
+                .log_dir
+                .as_path()
+                .join(format!("{}.{}", log_id, self.log_suffix));
+            std::fs::remove_file(path)?;
+            tracing::info!("removed the freeze memtable {}.", log_id);
+        }
         Ok(())
     }
 }
 
 impl Map for Memtable {
-    fn get<Q>(&self, key: &Q) -> Result<Option<&[u8]>, MapError>
+    fn get<Q>(&self, key: &Q) -> Result<Option<Arc<Bytes>>, MapError>
     where
         Q: AsRef<[u8]>,
     {
         if let Some(value) = self.active_tree.get(key.as_ref()) {
-            Ok(Some(value.as_ref()))
+            Ok(Some(value.clone()))
         } else if let Some(value) = self
             .freeze_tree
             .as_ref()
             .and_then(|tree| tree.get(key.as_ref()))
         {
-            Ok(Some(value.as_ref()))
+            Ok(Some(value.clone()))
         } else {
             Ok(None)
         }
@@ -204,15 +247,12 @@ impl Map for Memtable {
         self.log.flush().map_err(|_| MapError::WriteLog)?;
         let key_size = key.len();
         let value_size = value.len();
-        if let Some(old_value) = self.active_tree.insert(key, value) {
+        if let Some(old_value) = self.active_tree.insert(key, Arc::new(value)) {
             self.active_size -= old_value.len();
         } else {
             self.active_size += key_size;
         }
         self.active_size += value_size;
-        if self.active_size > self.switch_active_size && self.freeze_tree.is_none() {
-            self.force_switch()?;
-        }
         Ok(())
     }
 }

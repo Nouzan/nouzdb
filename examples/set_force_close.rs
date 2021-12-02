@@ -9,5 +9,6 @@ fn main() -> Result<()> {
     let key = args.next().ok_or(anyhow!("missing key input"))?;
     let value = args.next().ok_or(anyhow!("missing value input"))?;
     db.set(key, value)?;
+    db.force_close();
     Ok(())
 }
