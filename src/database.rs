@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Instant;
 use std::{ffi::OsString, fs::DirBuilder, path::Path};
 use thiserror::Error;
@@ -37,12 +37,15 @@ pub enum Error {
 }
 
 const DOT: char = '.';
+const TMP_SUFFIX: &str = "tmp";
 
 /// A [`Database`] instance.
 pub struct Database {
-    exiter: Option<mpsc::Sender<()>>,
+    merge_period: std::time::Duration,
+    poll_period: std::time::Duration,
     data_dir: PathBuf,
     data_suffix: String,
+    exiter: Option<mpsc::Sender<()>>,
     memtable: Arc<RwLock<Memtable>>,
     segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
     max_segment_id: Arc<Mutex<u64>>,
@@ -51,13 +54,14 @@ pub struct Database {
 
 impl Database {
     /// Create a new [`Database`] with a data folder path.
-    pub fn new(
-        dir: &str,
+    pub(crate) fn new(
+        path: &Path,
         log_suffix: &str,
         data_suffix: &str,
         switch_mem_size: usize,
+        merge_period: std::time::Duration,
+        poll_period: std::time::Duration,
     ) -> Result<Self, Error> {
-        let path = Path::new(dir);
         DirBuilder::new().recursive(true).create(path)?;
 
         let mut logs = BTreeMap::new();
@@ -89,7 +93,7 @@ impl Database {
             .unwrap_or_default();
         let data_dir = path.to_owned();
         let data_suffix = data_suffix.to_string();
-        let (memtable, segment) = Memtable::new(logs, dir, log_suffix, switch_mem_size)?;
+        let (memtable, segment) = Memtable::new(logs, path, log_suffix, switch_mem_size)?;
         let memtable = Arc::new(RwLock::new(memtable));
         let segments = Arc::new(RwLock::new(segments));
         let mut db = Self {
@@ -100,9 +104,11 @@ impl Database {
             segments,
             max_segment_id: Arc::new(Mutex::new(max_segment_id)),
             tasks: Vec::new(),
+            merge_period,
+            poll_period,
         };
         if let Some(segment) = segment {
-            db.write_segment(segment)?;
+            db.write_new_segment(segment)?;
         }
         db.start_merging_task();
         Ok(db)
@@ -114,8 +120,18 @@ impl Database {
         let segments = self.segments.clone();
         let dir = self.data_dir.clone();
         let suffix = self.data_suffix.clone();
+        let merge_period = self.merge_period;
+        let poll_period = self.poll_period;
         let task = thread::spawn(move || -> Result<(), std::io::Error> {
-            Self::merge_segments(rx, max_segment_id, segments, dir, suffix)
+            Self::merge_segments(
+                merge_period,
+                poll_period,
+                rx,
+                max_segment_id,
+                segments,
+                dir,
+                suffix,
+            )
         });
         self.exiter = Some(tx);
         self.tasks.push(task);
@@ -135,21 +151,17 @@ impl Database {
         Some((key, value))
     }
 
-    fn do_write_segment<P: AsRef<Path>>(
-        memtable: Arc<RwLock<Memtable>>,
-        segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
-        max_segment_id: Arc<Mutex<u64>>,
-        dir: &P,
-        suffix: &str,
-        segment: RawSegment,
-    ) -> JoinHandle<Result<(), std::io::Error>> {
-        let dir = dir.as_ref().to_owned();
-        let suffix = suffix.to_string();
-        thread::spawn(move || -> Result<(), std::io::Error> {
+    fn write_new_segment(&mut self, segment: RawSegment) -> Result<(), std::io::Error> {
+        let memtable = self.memtable.clone();
+        let segments = self.segments.clone();
+        let dir = self.data_dir.clone();
+        let suffix = self.data_suffix.clone();
+        let max_segment_id = self.max_segment_id.clone();
+        let task = thread::spawn(move || -> Result<(), std::io::Error> {
             let mut segment_id = max_segment_id.lock().unwrap();
             *segment_id += 1;
             let path = dir.as_path().join(format!("{}.{}", segment_id, suffix));
-            let tmp_path = dir.as_path().join(format!("{}.tmp", segment_id));
+            let tmp_path = dir.as_path().join(format!("{}.{}", segment_id, TMP_SUFFIX));
             tracing::info!("writing new segment {} to path {:?}", segment_id, tmp_path);
             segment.write_to_path(&tmp_path)?;
             std::fs::rename(&tmp_path, &path)?;
@@ -157,20 +169,7 @@ impl Database {
             memtable.write().unwrap().finalize_switch()?;
             segments.write().unwrap().insert(*segment_id, path);
             Ok(())
-        })
-    }
-
-    fn write_segment(&mut self, segment: RawSegment) -> Result<(), std::io::Error> {
-        let memtable = self.memtable.clone();
-        let segments = self.segments.clone();
-        let task = Self::do_write_segment(
-            memtable,
-            segments,
-            self.max_segment_id.clone(),
-            &self.data_dir,
-            &self.data_suffix,
-            segment,
-        );
+        });
         self.tasks.push(task);
         Ok(())
     }
@@ -204,16 +203,17 @@ impl Database {
     }
 
     fn merge_segments(
+        merge_period: std::time::Duration,
+        poll_period: std::time::Duration,
         exiter: mpsc::Receiver<()>,
         max_segment_id: Arc<Mutex<u64>>,
         segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
         dir: PathBuf,
         suffix: String,
     ) -> Result<(), std::io::Error> {
-        let merge_period = std::time::Duration::from_secs(60);
         let mut last_tick = Instant::now();
         loop {
-            thread::sleep(std::time::Duration::from_millis(100));
+            thread::sleep(poll_period);
             match exiter.try_recv() {
                 Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
                     break;
@@ -240,7 +240,8 @@ impl Database {
                         }
                         if !failed {
                             let path = dir.as_path().join(format!("{}.{}", segment_id, suffix));
-                            let tmp_path = dir.as_path().join(format!("{}.tmp", segment_id));
+                            let tmp_path =
+                                dir.as_path().join(format!("{}.{}", segment_id, TMP_SUFFIX));
                             let mut failed = false;
                             if let Ok(mut writer) =
                                 WriterBuilder::new().has_headers(false).from_path(&tmp_path)
@@ -350,7 +351,7 @@ impl Map for Database {
             write.set(key, value)?;
             write.try_switch()?
         } {
-            self.write_segment(segment)?;
+            self.write_new_segment(segment)?;
         }
         Ok(())
     }

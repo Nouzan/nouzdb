@@ -1,8 +1,8 @@
 use anyhow::Result;
-use nouzdb::{Database, Map};
+use nouzdb::{DatabaseBuilder, Map};
 
 fn main() -> Result<()> {
-    let mut db = Database::new("data/", "log", "data", 1024)?;
+    let mut db = DatabaseBuilder::default().open("data/")?;
     db.set("hello", "world")?;
     let value = db.get(b"hello")?.unwrap();
     assert_eq!(value.as_ref().as_ref(), b"world");
