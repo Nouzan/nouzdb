@@ -2,6 +2,11 @@
 name = "nouzdb"
 version = "0.1.0"
 edition = "2021"
+authors = ["Nouzan"]
+license = "MIT"
+description = "An embedded database for learning purpose that is based on SSTables."
+repository = "https://github.com/Nouzan/nouzdb"
+keywords = ["database"]
 
 [dependencies]
 tracing = "0.1"
