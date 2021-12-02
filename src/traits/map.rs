@@ -4,7 +4,7 @@ use bytes::Bytes;
 /// A Map.
 pub trait Map {
     /// Get the value corresponding to the given key.
-    fn get<Q>(&self, key: &Q) -> Result<&[u8], MapError>
+    fn get<Q>(&self, key: &Q) -> Result<Option<&[u8]>, MapError>
     where
         Q: AsRef<[u8]>;
 
