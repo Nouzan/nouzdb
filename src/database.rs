@@ -176,6 +176,7 @@ impl Database {
 
     fn get_from_segments<Q>(&self, key: &Q) -> Result<Option<Bytes>, MapError>
     where
+        Q: ?Sized,
         Q: AsRef<[u8]>,
     {
         for (_, path) in self
@@ -331,6 +332,7 @@ impl Database {
 impl Map for Database {
     fn get<Q>(&self, key: &Q) -> Result<Option<Arc<Bytes>>, MapError>
     where
+        Q: ?Sized,
         Q: AsRef<[u8]>,
     {
         if let Some(value) = self

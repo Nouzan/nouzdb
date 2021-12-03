@@ -249,6 +249,7 @@ impl Memtable {
 impl Map for Memtable {
     fn get<Q>(&self, key: &Q) -> Result<Option<Arc<Bytes>>, MapError>
     where
+        Q: ?Sized,
         Q: AsRef<[u8]>,
     {
         if let Some(value) = self.active_tree.get(key.as_ref()) {
