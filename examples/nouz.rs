@@ -1,10 +1,29 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use nouzdb::{DatabaseBuilder, Map};
 use rustyline::error::ReadlineError;
+use structopt::StructOpt;
+
+#[derive(Debug, StructOpt)]
+struct Opt {
+    #[structopt(parse(from_os_str), default_value = "data/")]
+    path: PathBuf,
+
+    #[structopt(long, short, default_value = "1048576")]
+    switch_mem_size: usize,
+
+    #[structopt(long, short, default_value = "3600")]
+    merge_period_secs: u64,
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let mut db = DatabaseBuilder::default().open("data/")?;
+    let opt = Opt::from_args_safe()?;
+    let mut db = DatabaseBuilder::default()
+        .switch_mem_size(opt.switch_mem_size)
+        .merge_period(std::time::Duration::from_secs(opt.merge_period_secs))
+        .open(&opt.path)?;
     let mut rl = rustyline::Editor::<()>::new();
     loop {
         let readline = rl.readline(">> ");
