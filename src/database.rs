@@ -365,6 +365,32 @@ impl Drop for Database {
         for task in self.tasks.drain(..) {
             let _ = task.join();
         }
+        if let Ok(mut segment_id) = self.max_segment_id.try_lock() {
+            *segment_id += 1;
+            if let Ok(mut memtable) = self.memtable.try_write() {
+                if let Some(segment) = memtable.to_raw_segment() {
+                    let tmp_path = self
+                        .data_dir
+                        .as_path()
+                        .join(format!("{}{}{}", *segment_id, DOT, TMP_SUFFIX));
+                    let path = self
+                        .data_dir
+                        .as_path()
+                        .join(format!("{}{}{}", *segment_id, DOT, self.data_suffix));
+                    if segment.write_to_path(&tmp_path).is_ok() {
+                        match std::fs::rename(&tmp_path, &path) {
+                            Ok(_) => {
+                                let _ = memtable.remove_active_log();
+                                tracing::info!("created new segment file at path: {:?}", path);
+                            }
+                            Err(err) => {
+                                tracing::error!("rename temp segment file error: err={}", err);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         tracing::info!("database closed");
     }
 }

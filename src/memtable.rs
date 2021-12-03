@@ -213,9 +213,36 @@ impl Memtable {
                 .as_path()
                 .join(format!("{}.{}", log_id, self.log_suffix));
             std::fs::remove_file(path)?;
-            tracing::info!("removed the freeze memtable {}.", log_id);
+            tracing::info!("removed the log for freeze memtable {}.", log_id);
         }
         Ok(())
+    }
+
+    pub(crate) fn to_raw_segment(&mut self) -> Option<RawSegment> {
+        if self.freeze_tree.is_none() {
+            let mut tree = Tree::new();
+            std::mem::swap(&mut tree, &mut self.active_tree);
+            Some(RawSegment::from(Arc::new(tree)))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn remove_active_log(&mut self) -> Result<bool, std::io::Error> {
+        if self.active_tree.is_empty() {
+            let path = self
+                .log_dir
+                .as_path()
+                .join(format!("{}.{}", self.active_log_id, self.log_suffix));
+            std::fs::remove_file(path)?;
+            tracing::info!(
+                "removed the log for active memtable {}.",
+                self.active_log_id
+            );
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
