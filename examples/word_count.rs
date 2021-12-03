@@ -10,6 +10,15 @@ use structopt::StructOpt;
 struct Opt {
     #[structopt(parse(from_os_str))]
     dir: PathBuf,
+
+    #[structopt(long, short, parse(from_os_str), default_value = "data/")]
+    db: PathBuf,
+
+    #[structopt(long, short, default_value = "1048576")]
+    switch_mem_size: usize,
+
+    #[structopt(long, short, default_value = "3600")]
+    merge_period_secs: u64,
 }
 
 fn parse_to_usize(bytes: &[u8]) -> Result<usize> {
@@ -19,7 +28,10 @@ fn parse_to_usize(bytes: &[u8]) -> Result<usize> {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let opt = Opt::from_args();
-    let mut db = DatabaseBuilder::default().open("data/")?;
+    let mut db = DatabaseBuilder::default()
+        .switch_mem_size(opt.switch_mem_size)
+        .merge_period(std::time::Duration::from_secs(opt.merge_period_secs))
+        .open(&opt.db)?;
     for entry in opt.dir.read_dir()? {
         let path = entry?.path();
         if path.is_file() {
