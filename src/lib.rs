@@ -12,4 +12,4 @@ pub mod traits;
 pub use builder::DatabaseBuilder;
 pub use database::{Database, Error};
 pub use errors::MapError;
-pub use traits::Map;
+pub use traits::{Get, Map};

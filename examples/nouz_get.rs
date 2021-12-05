@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use nouzdb::{DatabaseBuilder, Map};
+use nouzdb::{DatabaseBuilder, Get};
 use std::env;
 
 fn main() -> Result<()> {

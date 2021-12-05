@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nouzdb::{DatabaseBuilder, Map};
+use nouzdb::{DatabaseBuilder, Get, Map};
 
 fn main() -> Result<()> {
     let mut db = DatabaseBuilder::default().open("data/")?;

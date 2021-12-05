@@ -3,10 +3,11 @@
 use crate::errors::MapError;
 use crate::memtable::Memtable;
 pub use crate::memtable::MemtableError;
-use crate::segment::RawSegment;
+use crate::segment::{RawSegment, Segment};
 use crate::traits::Map;
+use crate::Get;
 use bytes::Bytes;
-use csv::{ByteRecord, ReaderBuilder, WriterBuilder};
+use csv::WriterBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -39,6 +40,8 @@ pub enum Error {
 const DOT: char = '.';
 const TMP_SUFFIX: &str = "tmp";
 
+type Segments = BTreeMap<u64, Segment>;
+
 /// A [`Database`] instance.
 pub struct Database {
     merge_period: std::time::Duration,
@@ -47,7 +50,7 @@ pub struct Database {
     data_suffix: String,
     exiter: Option<mpsc::Sender<()>>,
     memtable: Arc<RwLock<Memtable>>,
-    segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+    segments: Arc<RwLock<Segments>>,
     max_segment_id: Arc<Mutex<u64>>,
     tasks: Vec<thread::JoinHandle<Result<(), std::io::Error>>>,
 }
@@ -81,7 +84,7 @@ impl Database {
                         let id = id
                             .parse()
                             .map_err(|_| Error::ParseSegemntId(id.to_string()))?;
-                        segments.insert(id, entry.path());
+                        segments.insert(id, Segment::try_from(entry.path())?);
                     }
                 }
             }
@@ -145,12 +148,6 @@ impl Database {
         self.tasks.clear();
     }
 
-    fn record_to_kv(record: &ByteRecord) -> Option<(&[u8], Bytes)> {
-        let key = record.get(0)?;
-        let value = Bytes::copy_from_slice(record.get(1)?);
-        Some((key, value))
-    }
-
     fn write_new_segment(&mut self, segment: RawSegment) -> Result<(), std::io::Error> {
         let memtable = self.memtable.clone();
         let segments = self.segments.clone();
@@ -167,41 +164,31 @@ impl Database {
                 .as_path()
                 .join(format!("{}{}{}", segment_id, DOT, TMP_SUFFIX));
             tracing::info!("writing new segment {} to path {:?}", segment_id, tmp_path);
-            segment.write_to_path(&tmp_path)?;
-            std::fs::rename(&tmp_path, &path)?;
+            let mut segment = segment.write_to_path(&tmp_path)?;
+            segment.move_to(&path)?;
             tracing::info!("new segment {} is written to path {:?}", segment_id, path);
             memtable.write().unwrap().finalize_switch()?;
-            segments.write().unwrap().insert(*segment_id, path);
+            segments.write().unwrap().insert(*segment_id, segment);
             Ok(())
         });
         self.tasks.push(task);
         Ok(())
     }
 
-    fn get_from_segments<Q>(&self, key: &Q) -> Result<Option<Bytes>, MapError>
+    fn get_from_segments<Q>(&self, key: &Q) -> Result<Option<Arc<Bytes>>, MapError>
     where
         Q: ?Sized,
         Q: AsRef<[u8]>,
     {
-        for (_, path) in self
+        for (_, segment) in self
             .segments
             .read()
             .map_err(|_| MapError::ReadLock)?
             .iter()
             .rev()
         {
-            let mut reader = ReaderBuilder::new()
-                .has_headers(false)
-                .from_path(path)
-                .map_err(std::io::Error::from)?;
-            for record in reader.byte_records() {
-                if let Ok(record) = record {
-                    if let Some((k, v)) = Self::record_to_kv(&record) {
-                        if k == key.as_ref() {
-                            return Ok(Some(v));
-                        }
-                    }
-                }
+            if let Some(value) = segment.get(key)? {
+                return Ok(Some(value));
             }
         }
         Ok(None)
@@ -212,7 +199,7 @@ impl Database {
         poll_period: std::time::Duration,
         exiter: mpsc::Receiver<()>,
         max_segment_id: Arc<Mutex<u64>>,
-        segments: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+        segments: Arc<RwLock<Segments>>,
         dir: PathBuf,
         suffix: String,
     ) -> Result<(), std::io::Error> {
@@ -233,10 +220,8 @@ impl Database {
                         last_tick = Instant::now();
                         let mut segment_readers = BTreeMap::new();
                         let mut failed = false;
-                        for (id, path) in segments.read().unwrap().iter() {
-                            if let Ok(reader) =
-                                ReaderBuilder::new().has_headers(false).from_path(path)
-                            {
+                        for (id, segment) in segments.read().unwrap().iter() {
+                            if let Ok(reader) = segment.to_reader() {
                                 segment_readers.insert(*id, reader);
                             } else {
                                 failed = true;
@@ -305,22 +290,39 @@ impl Database {
                                     }
                                 }
                                 if !failed {
-                                    if let Err(err) = std::fs::rename(&tmp_path, &path) {
-                                        tracing::error!(
-                                            "failed to rename the merged segment file: err={}",
-                                            err
-                                        );
-                                    } else {
-                                        for id in segment_readers.keys() {
-                                            if let Some(path) = segments.write().unwrap().remove(id)
-                                            {
-                                                if let Err(err) = std::fs::remove_file(&path) {
-                                                    tracing::error!("failed to remove the old segment file in path {:?}, err={}", path, err);
+                                    match Segment::try_from(tmp_path) {
+                                        Ok(mut segment) => {
+                                            if let Err(err) = segment.move_to(&path) {
+                                                tracing::error!(
+                                                    "failed to rename the merged segment file: err={}",
+                                                    err
+                                                );
+                                            } else {
+                                                for id in segment_readers.keys() {
+                                                    if let Some(old_segment) =
+                                                        segments.write().unwrap().remove(id)
+                                                    {
+                                                        if let Err(err) = old_segment.remove() {
+                                                            tracing::error!("failed to remove the old segment file in path {:?}, err={}", path, err);
+                                                        }
+                                                    }
                                                 }
+                                                tracing::info!(
+                                                    "merged segments to to path {:?}",
+                                                    path
+                                                );
+                                                segments
+                                                    .write()
+                                                    .unwrap()
+                                                    .insert(*segment_id, segment);
                                             }
                                         }
-                                        tracing::info!("merged segments to to path {:?}", path);
-                                        segments.write().unwrap().insert(*segment_id, path);
+                                        Err(err) => {
+                                            tracing::error!(
+                                                "failed to initialize the merged segment: err={}",
+                                                err
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -333,7 +335,7 @@ impl Database {
     }
 }
 
-impl Map for Database {
+impl Get for Database {
     fn get<Q>(&self, key: &Q) -> Result<Option<Arc<Bytes>>, MapError>
     where
         Q: ?Sized,
@@ -347,10 +349,12 @@ impl Map for Database {
         {
             Ok(Some(value))
         } else {
-            Ok(self.get_from_segments(key)?.map(Arc::new))
+            Ok(self.get_from_segments(key)?)
         }
     }
+}
 
+impl Map for Database {
     fn set<K: Into<Bytes>, V: Into<Bytes>>(&mut self, key: K, value: V) -> Result<(), MapError> {
         if let Some(segment) = {
             let mut write = self.memtable.write().map_err(|_| MapError::WriteLock)?;

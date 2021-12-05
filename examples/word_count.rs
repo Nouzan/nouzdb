@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nouzdb::{DatabaseBuilder, Map};
+use nouzdb::{DatabaseBuilder, Get, Map};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;

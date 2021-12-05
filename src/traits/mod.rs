@@ -3,4 +3,4 @@
 /// Map.
 pub mod map;
 
-pub use map::Map;
+pub use map::{Get, Map};

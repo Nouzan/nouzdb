@@ -1,5 +1,5 @@
 use crate::segment::RawSegment;
-use crate::{Map, MapError};
+use crate::{Get, Map, MapError};
 use bytes::{Buf, Bytes};
 use crc::{Crc, CRC_32_AIXM};
 use csv::{ByteRecord, ReaderBuilder, Writer, WriterBuilder};
@@ -246,7 +246,7 @@ impl Memtable {
     }
 }
 
-impl Map for Memtable {
+impl Get for Memtable {
     fn get<Q>(&self, key: &Q) -> Result<Option<Arc<Bytes>>, MapError>
     where
         Q: ?Sized,
@@ -264,7 +264,9 @@ impl Map for Memtable {
             Ok(None)
         }
     }
+}
 
+impl Map for Memtable {
     fn set<K: Into<Bytes>, V: Into<Bytes>>(&mut self, key: K, value: V) -> Result<(), MapError> {
         let key = key.into();
         let value = value.into();

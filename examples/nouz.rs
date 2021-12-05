@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use nouzdb::{DatabaseBuilder, Map};
+use nouzdb::{DatabaseBuilder, Get, Map};
 use rustyline::error::ReadlineError;
 use structopt::StructOpt;
 
