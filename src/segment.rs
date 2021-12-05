@@ -69,15 +69,10 @@ impl Segment {
         let mut reader = self.to_reader()?;
         let mut index = BTreeMap::new();
         let mut last_block_offset = 0;
-        let mut offset = 0;
         loop {
-            let flag = offset == 57340;
-            offset = reader.position().byte();
+            let offset = reader.position().byte();
             tracing::debug!("offset: {}", offset);
             let more = reader.read_byte_record(&mut record)?;
-            if flag {
-                println!("{:?}", record);
-            }
             if offset - last_block_offset >= block_size {
                 last_block_offset = offset;
                 if let Some(key) = record_to_key(&record) {
