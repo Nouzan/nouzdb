@@ -160,8 +160,12 @@ impl Database {
         let task = thread::spawn(move || -> Result<(), std::io::Error> {
             let mut segment_id = max_segment_id.lock().unwrap();
             *segment_id += 1;
-            let path = dir.as_path().join(format!("{}.{}", segment_id, suffix));
-            let tmp_path = dir.as_path().join(format!("{}.{}", segment_id, TMP_SUFFIX));
+            let path = dir
+                .as_path()
+                .join(format!("{}{}{}", segment_id, DOT, suffix));
+            let tmp_path = dir
+                .as_path()
+                .join(format!("{}{}{}", segment_id, DOT, TMP_SUFFIX));
             tracing::info!("writing new segment {} to path {:?}", segment_id, tmp_path);
             segment.write_to_path(&tmp_path)?;
             std::fs::rename(&tmp_path, &path)?;
