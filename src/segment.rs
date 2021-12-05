@@ -2,7 +2,6 @@ use crate::memtable::Tree;
 use crate::{Get, MapError};
 use bytes::Bytes;
 use csv::{ByteRecord, Reader, ReaderBuilder, WriterBuilder};
-use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -52,7 +51,7 @@ pub(crate) fn record_to_key(record: &ByteRecord) -> Option<Bytes> {
 /// Segment.
 #[derive(Debug)]
 pub struct Segment {
-    index: Option<BTreeMap<Bytes, u64>>,
+    index: Option<Vec<(Bytes, u64)>>,
     path: PathBuf,
 }
 
@@ -67,7 +66,7 @@ impl Segment {
     pub(crate) fn initialize_index(&mut self, block_size: u64) -> Result<(), std::io::Error> {
         let mut record = ByteRecord::new();
         let mut reader = self.to_reader()?;
-        let mut index = BTreeMap::new();
+        let mut index = Vec::new();
         let mut last_block_offset = 0;
         loop {
             let offset = reader.position().byte();
@@ -77,7 +76,7 @@ impl Segment {
                 last_block_offset = offset;
                 if let Some(key) = record_to_key(&record) {
                     tracing::debug!("key: {:?}", key);
-                    index.insert(key, offset);
+                    index.push((key, offset));
                 } else {
                     tracing::debug!("not key in this record");
                 }
@@ -128,11 +127,11 @@ impl Get for Segment {
         Q: AsRef<[u8]>,
     {
         let offset = if let Some(index) = self.index.as_ref() {
-            index
-                .iter()
-                .rev()
-                .find(|(k, _)| *k <= key.as_ref())
-                .map(|(_, p)| *p)
+            match index.binary_search_by_key(&key.as_ref(), |(k, _)| k) {
+                Ok(idx) => index.get(idx).map(|(_, p)| *p),
+                Err(0) => None,
+                Err(idx) => index.get(idx - 1).map(|(_, p)| *p),
+            }
         } else {
             Some(0)
         };
