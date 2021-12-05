@@ -73,7 +73,7 @@ impl Segment {
             let offset = reader.position().byte();
             tracing::debug!("offset: {}", offset);
             let more = reader.read_byte_record(&mut record)?;
-            if offset - last_block_offset >= block_size {
+            if offset == 0 || offset - last_block_offset >= block_size {
                 last_block_offset = offset;
                 if let Some(key) = record_to_key(&record) {
                     tracing::debug!("key: {:?}", key);
@@ -87,6 +87,7 @@ impl Segment {
             }
         }
         self.index = Some(index);
+        tracing::debug!("index={:?}", self.index);
         Ok(())
     }
 
