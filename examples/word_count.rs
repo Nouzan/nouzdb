@@ -19,6 +19,9 @@ struct Opt {
 
     #[structopt(long, short, default_value = "3600")]
     merge_period_secs: u64,
+
+    #[structopt(long, short, default_value = "4096")]
+    block_size: u64,
 }
 
 fn parse_to_usize(bytes: &[u8]) -> Result<usize> {
@@ -31,6 +34,7 @@ fn main() -> Result<()> {
     let mut db = DatabaseBuilder::default()
         .switch_mem_size(opt.switch_mem_size)
         .merge_period(std::time::Duration::from_secs(opt.merge_period_secs))
+        .block_size(opt.block_size)
         .open(&opt.db)?;
     for entry in opt.dir.read_dir()? {
         let path = entry?.path();
