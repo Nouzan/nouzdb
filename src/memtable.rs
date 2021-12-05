@@ -98,7 +98,6 @@ impl Memtable {
                         if !more {
                             break;
                         }
-                        record.clear();
                     }
                     Err(err) => {
                         tracing::error!("read record error: {}", err);

@@ -13,6 +13,8 @@ pub const DEFAULT_SWTICH_MEM_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MERGE_PERIOD_SECS: u64 = 3600;
 /// Default poll period in millis.
 pub const DEFAULT_POLL_PERIOD_MILLIS: u64 = 100;
+/// Default block_size.
+pub const DEFAULT_BLOCK_SIZE: u64 = 4 * 1024;
 
 /// Database builder.
 #[derive(Debug)]
@@ -22,6 +24,7 @@ pub struct DatabaseBuilder {
     switch_mem_size: usize,
     merge_period: std::time::Duration,
     poll_period: std::time::Duration,
+    block_size: u64,
 }
 
 impl Default for DatabaseBuilder {
@@ -32,6 +35,7 @@ impl Default for DatabaseBuilder {
             switch_mem_size: DEFAULT_SWTICH_MEM_SIZE,
             merge_period: std::time::Duration::from_secs(DEFAULT_MERGE_PERIOD_SECS),
             poll_period: std::time::Duration::from_millis(DEFAULT_POLL_PERIOD_MILLIS),
+            block_size: DEFAULT_BLOCK_SIZE,
         }
     }
 }
@@ -49,6 +53,7 @@ impl DatabaseBuilder {
             self.switch_mem_size,
             self.merge_period,
             self.poll_period,
+            self.block_size,
         )
     }
 
@@ -79,6 +84,12 @@ impl DatabaseBuilder {
     /// Set poll period.
     pub fn poll_period(&mut self, duration: std::time::Duration) -> &mut Self {
         self.poll_period = duration;
+        self
+    }
+
+    /// Set segment block size.
+    pub fn block_size(&mut self, size: u64) -> &mut Self {
+        self.block_size = size;
         self
     }
 }

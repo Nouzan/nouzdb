@@ -9,6 +9,7 @@ use crate::Get;
 use bytes::Bytes;
 use csv::WriterBuilder;
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -44,6 +45,7 @@ type Segments = BTreeMap<u64, Segment>;
 
 /// A [`Database`] instance.
 pub struct Database {
+    block_size: u64,
     merge_period: std::time::Duration,
     poll_period: std::time::Duration,
     data_dir: PathBuf,
@@ -64,6 +66,7 @@ impl Database {
         switch_mem_size: usize,
         merge_period: std::time::Duration,
         poll_period: std::time::Duration,
+        block_size: u64,
     ) -> Result<Self, Error> {
         DirBuilder::new().recursive(true).create(path)?;
 
@@ -84,7 +87,9 @@ impl Database {
                         let id = id
                             .parse()
                             .map_err(|_| Error::ParseSegemntId(id.to_string()))?;
-                        segments.insert(id, Segment::try_from(entry.path())?);
+                        let mut segment = Segment::from_path(&entry.path());
+                        segment.initialize_index(block_size)?;
+                        segments.insert(id, segment);
                     }
                 }
             }
@@ -100,6 +105,7 @@ impl Database {
         let memtable = Arc::new(RwLock::new(memtable));
         let segments = Arc::new(RwLock::new(segments));
         let mut db = Self {
+            block_size,
             exiter: None,
             data_dir,
             memtable,
@@ -125,8 +131,10 @@ impl Database {
         let suffix = self.data_suffix.clone();
         let merge_period = self.merge_period;
         let poll_period = self.poll_period;
+        let block_size = self.block_size;
         let task = thread::spawn(move || -> Result<(), std::io::Error> {
             Self::merge_segments(
+                block_size,
                 merge_period,
                 poll_period,
                 rx,
@@ -154,6 +162,7 @@ impl Database {
         let dir = self.data_dir.clone();
         let suffix = self.data_suffix.clone();
         let max_segment_id = self.max_segment_id.clone();
+        let block_size = self.block_size;
         let task = thread::spawn(move || -> Result<(), std::io::Error> {
             let mut segment_id = max_segment_id.lock().unwrap();
             *segment_id += 1;
@@ -165,6 +174,7 @@ impl Database {
                 .join(format!("{}{}{}", segment_id, DOT, TMP_SUFFIX));
             tracing::info!("writing new segment {} to path {:?}", segment_id, tmp_path);
             let mut segment = segment.write_to_path(&tmp_path)?;
+            segment.initialize_index(block_size)?;
             segment.move_to(&path)?;
             tracing::info!("new segment {} is written to path {:?}", segment_id, path);
             memtable.write().unwrap().finalize_switch()?;
@@ -195,6 +205,7 @@ impl Database {
     }
 
     fn merge_segments(
+        block_size: u64,
         merge_period: std::time::Duration,
         poll_period: std::time::Duration,
         exiter: mpsc::Receiver<()>,
@@ -229,13 +240,19 @@ impl Database {
                             }
                         }
                         if !failed {
-                            let path = dir.as_path().join(format!("{}.{}", segment_id, suffix));
-                            let tmp_path =
-                                dir.as_path().join(format!("{}.{}", segment_id, TMP_SUFFIX));
+                            let path = dir
+                                .as_path()
+                                .join(format!("{}{}{}", segment_id, DOT, suffix));
+                            let tmp_path = dir
+                                .as_path()
+                                .join(format!("{}{}{}", segment_id, DOT, TMP_SUFFIX));
                             let mut failed = false;
-                            if let Ok(mut writer) =
-                                WriterBuilder::new().has_headers(false).from_path(&tmp_path)
+                            if let Ok(tmp_file) =
+                                OpenOptions::new().create(true).write(true).open(&tmp_path)
                             {
+                                let mut writer = WriterBuilder::new()
+                                    .has_headers(false)
+                                    .from_writer(tmp_file);
                                 tracing::info!("merging segments to to path {:?}", tmp_path);
                                 let mut segment_records = segment_readers
                                     .iter_mut()
@@ -290,8 +307,9 @@ impl Database {
                                     }
                                 }
                                 if !failed {
-                                    match Segment::try_from(tmp_path) {
-                                        Ok(mut segment) => {
+                                    let mut segment = Segment::from_path(&tmp_path);
+                                    match segment.initialize_index(block_size) {
+                                        Ok(_) => {
                                             if let Err(err) = segment.move_to(&path) {
                                                 tracing::error!(
                                                     "failed to rename the merged segment file: err={}",
@@ -324,6 +342,9 @@ impl Database {
                                             );
                                         }
                                     }
+                                }
+                                if tmp_path.exists() {
+                                    let _ = std::fs::remove_file(&tmp_path);
                                 }
                             }
                         }

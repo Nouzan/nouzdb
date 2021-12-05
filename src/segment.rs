@@ -24,7 +24,7 @@ impl RawSegment {
             record.push_field(value);
             writer.write_byte_record(&record)?;
         }
-        Segment::try_from(path.as_ref().to_owned())
+        Ok(Segment::from_path(path))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -52,35 +52,46 @@ pub(crate) fn record_to_key(record: &ByteRecord) -> Option<Bytes> {
 /// Segment.
 #[derive(Debug)]
 pub struct Segment {
-    index: BTreeMap<Bytes, u64>,
+    index: Option<BTreeMap<Bytes, u64>>,
     path: PathBuf,
 }
 
 impl Segment {
-    fn from_path_without_init(path: PathBuf) -> Self {
+    pub(crate) fn from_path<P: AsRef<Path>>(path: &P) -> Self {
         Self {
-            path,
-            index: BTreeMap::new(),
+            path: path.as_ref().to_owned(),
+            index: None,
         }
     }
 
-    fn init_index(&mut self) -> Result<(), std::io::Error> {
+    pub(crate) fn initialize_index(&mut self, block_size: u64) -> Result<(), std::io::Error> {
         let mut record = ByteRecord::new();
         let mut reader = self.to_reader()?;
+        let mut index = BTreeMap::new();
+        let mut last_block_offset = 0;
+        let mut offset = 0;
         loop {
-            let offset = reader.position().byte();
+            let flag = offset == 57340;
+            offset = reader.position().byte();
             tracing::debug!("offset: {}", offset);
             let more = reader.read_byte_record(&mut record)?;
-            if let Some(key) = record_to_key(&record) {
-                tracing::debug!("key: {:?}", key);
-                self.index.insert(key, offset);
-            } else {
-                tracing::debug!("not key in this record");
+            if flag {
+                println!("{:?}", record);
+            }
+            if offset - last_block_offset >= block_size {
+                last_block_offset = offset;
+                if let Some(key) = record_to_key(&record) {
+                    tracing::debug!("key: {:?}", key);
+                    index.insert(key, offset);
+                } else {
+                    tracing::debug!("not key in this record");
+                }
             }
             if !more {
                 break;
             }
         }
+        self.index = Some(index);
         Ok(())
     }
 
@@ -93,6 +104,7 @@ impl Segment {
     pub(crate) fn to_reader(&self) -> Result<Reader<File>, std::io::Error> {
         Ok(ReaderBuilder::new()
             .has_headers(false)
+            .flexible(true)
             .from_path(&self.path)?)
     }
 
@@ -113,29 +125,22 @@ impl Segment {
     }
 }
 
-impl TryFrom<PathBuf> for Segment {
-    type Error = std::io::Error;
-
-    fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
-        let mut segment = Self::from_path_without_init(path);
-        segment.init_index()?;
-        Ok(segment)
-    }
-}
-
 impl Get for Segment {
     fn get<Q>(&self, key: &Q) -> Result<Option<Arc<bytes::Bytes>>, MapError>
     where
         Q: ?Sized,
         Q: AsRef<[u8]>,
     {
-        if let Some(offset) = self
-            .index
-            .iter()
-            .rev()
-            .find(|(k, _)| *k <= key.as_ref())
-            .map(|(_, p)| *p)
-        {
+        let offset = if let Some(index) = self.index.as_ref() {
+            index
+                .iter()
+                .rev()
+                .find(|(k, _)| *k <= key.as_ref())
+                .map(|(_, p)| *p)
+        } else {
+            Some(0)
+        };
+        if let Some(offset) = offset {
             for record in self.records(offset)? {
                 if let Ok(record) = record {
                     if let Some((k, v)) = record_to_kv(&record) {
