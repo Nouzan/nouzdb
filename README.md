@@ -1,5 +1,5 @@
 # Nouzdb
-An embedded database for learning purpose that is based on SSTables.
+An embedded key-value storage for learning purpose, which is based on the idea of SSTable / LSM-tree.
 
 ## Plan
 - [x] Implement a memtable.
