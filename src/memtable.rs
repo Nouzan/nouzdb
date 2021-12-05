@@ -191,13 +191,14 @@ impl Memtable {
     }
 
     pub(crate) fn try_switch(&mut self) -> Result<Option<RawSegment>, std::io::Error> {
-        tracing::debug!(
+        tracing::info!(
             "active_size={} switch_size={}",
             self.active_size,
             self.switch_active_size
         );
         if self.active_size > self.switch_active_size && self.freeze_tree.is_none() {
             let segment = self.force_switch()?;
+            self.active_size = 0;
             Ok(Some(segment))
         } else {
             Ok(None)
