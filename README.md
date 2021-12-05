@@ -9,5 +9,5 @@ An embedded database for learning purpose that is based on SSTables.
 - [x] Allow searching for keys in sorted-string segment files.
 - [x] Implement a merging process for the segment files.
 - [x] Build in-memory indexes for every segment files.
-- [ ] Make the indexes be sparse to save memory by seperating the segment files into blocks and picking the index of the smallest key in each block.
+- [x] Make the indexes be sparse to save memory by seperating the segment files into blocks and picking the index of the smallest key in each block.
 - [ ] Compress the blocks before writing to the disk.
