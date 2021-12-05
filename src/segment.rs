@@ -2,7 +2,9 @@ use crate::memtable::Tree;
 use crate::{Get, MapError};
 use bytes::Bytes;
 use csv::{ByteRecord, Reader, ReaderBuilder, WriterBuilder};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,6 +26,10 @@ impl RawSegment {
         }
         Segment::try_from(path.as_ref().to_owned())
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.freeze.is_empty()
+    }
 }
 
 impl From<Arc<Tree>> for RawSegment {
@@ -38,13 +44,46 @@ pub(crate) fn record_to_kv(record: &ByteRecord) -> Option<(&[u8], Bytes)> {
     Some((key, value))
 }
 
+pub(crate) fn record_to_key(record: &ByteRecord) -> Option<Bytes> {
+    let key = record.get(0)?;
+    Some(Bytes::copy_from_slice(key))
+}
+
 /// Segment.
 #[derive(Debug)]
 pub struct Segment {
+    index: BTreeMap<Bytes, u64>,
     path: PathBuf,
 }
 
 impl Segment {
+    fn from_path_without_init(path: PathBuf) -> Self {
+        Self {
+            path,
+            index: BTreeMap::new(),
+        }
+    }
+
+    fn init_index(&mut self) -> Result<(), std::io::Error> {
+        let mut record = ByteRecord::new();
+        let mut reader = self.to_reader()?;
+        loop {
+            let offset = reader.position().byte();
+            tracing::debug!("offset: {}", offset);
+            let more = reader.read_byte_record(&mut record)?;
+            if let Some(key) = record_to_key(&record) {
+                tracing::debug!("key: {:?}", key);
+                self.index.insert(key, offset);
+            } else {
+                tracing::debug!("not key in this record");
+            }
+            if !more {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn move_to<P: AsRef<Path>>(&mut self, path: &P) -> Result<(), std::io::Error> {
         std::fs::rename(&self.path, path)?;
         self.path = path.as_ref().to_owned();
@@ -57,6 +96,18 @@ impl Segment {
             .from_path(&self.path)?)
     }
 
+    pub(crate) fn records(
+        &self,
+        start: u64,
+    ) -> Result<impl Iterator<Item = Result<ByteRecord, std::io::Error>>, std::io::Error> {
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(start))?;
+        let reader = ReaderBuilder::new().has_headers(false).from_reader(file);
+        Ok(reader
+            .into_byte_records()
+            .map(|res| res.map_err(std::io::Error::from)))
+    }
+
     pub(crate) fn remove(self) -> Result<(), std::io::Error> {
         std::fs::remove_file(&self.path)
     }
@@ -66,7 +117,9 @@ impl TryFrom<PathBuf> for Segment {
     type Error = std::io::Error;
 
     fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
-        Ok(Self { path })
+        let mut segment = Self::from_path_without_init(path);
+        segment.init_index()?;
+        Ok(segment)
     }
 }
 
@@ -76,15 +129,19 @@ impl Get for Segment {
         Q: ?Sized,
         Q: AsRef<[u8]>,
     {
-        let mut reader = ReaderBuilder::new()
-            .has_headers(false)
-            .from_path(&self.path)
-            .map_err(std::io::Error::from)?;
-        for record in reader.byte_records() {
-            if let Ok(record) = record {
-                if let Some((k, v)) = record_to_kv(&record) {
-                    if k == key.as_ref() {
-                        return Ok(Some(Arc::new(v)));
+        if let Some(offset) = self
+            .index
+            .iter()
+            .rev()
+            .find(|(k, _)| *k <= key.as_ref())
+            .map(|(_, p)| *p)
+        {
+            for record in self.records(offset)? {
+                if let Ok(record) = record {
+                    if let Some((k, v)) = record_to_kv(&record) {
+                        if k == key.as_ref() {
+                            return Ok(Some(Arc::new(v)));
+                        }
                     }
                 }
             }
